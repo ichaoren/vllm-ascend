@@ -1,104 +1,111 @@
-diff --git a/vllm_ascend/core/recompute_scheduler.py b/vllm_ascend/core/recompute_scheduler.py
-index 0bfe35e0a..0ce85460b 100644
---- a/vllm_ascend/core/recompute_scheduler.py
-+++ b/vllm_ascend/core/recompute_scheduler.py
-@@ -942,6 +942,26 @@ class RecomputeScheduler(Scheduler):
-             preempted_reqs=preempted_req_data,
-             recomputed_reqs=recomputed_reqs,
-         )
-+        if PD_TTFT_ENABLED and self._pd_kv_ready_ts:
-+            # PD_TTFT D11b start: carried to the worker process.
-+            _pd_sched = pd_ttft_now()
-+            scheduler_output.pd_ttft_schedule_ts = _pd_sched
-+            for _pd_rid, _pd_promote in self._pd_kv_ready_ts.items():
-+                if _pd_rid in self._pd_d11a_done:
-+                    continue
-+                self._pd_d11a_done.add(_pd_rid)
-+                # PD_TTFT D11a: promote -> this schedule() pass produced a
-+                # batch. num_tokens is the decisive number: 1 means a genuine
-+                # single-token decode, a large value means D recomputes the
-+                # whole prompt and the 130ms is real compute, not waiting.
-+                pd_ttft_trace(
-+                    "D11a_to_batch",
-+                    req_id=_pd_rid,
-+                    elapsed_ms=(_pd_sched - _pd_promote) * 1000,
-+                    num_tokens=num_scheduled_tokens.get(_pd_rid, 0),
-+                    batch_total_tokens=total_num_scheduled_tokens,
-+                    batch_reqs=len(num_scheduled_tokens),
-+                )
- 
-         # NOTE(Kuntai): this function is designed for multiple purposes:
-         # 1. Plan the KV cache store
-@@ -1132,13 +1152,40 @@ class RecomputeScheduler(Scheduler):
-                     # update_from_output without calling super(), so the hook in
-                     # vllm's Scheduler never runs on this path.
-                     _pd_ready = self._pd_kv_ready_ts.pop(request.request_id, None)
-+                    self._pd_d11a_done.discard(request.request_id)
-                     if _pd_ready is not None:
-                         _pd_tok = pd_ttft_now()
-                         _pd_send = getattr(request, "pd_ttft_send_ts", None)
-+                        _pd_sched = getattr(
-+                            scheduler_output, "pd_ttft_schedule_ts", None
-+                        )
-+                        _pd_x0 = model_runner_output.pd_ttft_exec_start_ts
-+                        _pd_x1 = model_runner_output.pd_ttft_exec_done_ts
-+                        # D11 split. b = schedule->execute IPC (EngineCore->
-+                        # Worker), c = real forward+sample inside the worker,
-+                        # d = output IPC back, e = update_from_output tail.
-                         pd_ttft_trace(
-                             "D11_recompute",
-                             req_id=request.request_id,
-                             elapsed_ms=(_pd_tok - _pd_ready) * 1000,
-+                            b_sched_to_exec_ms=(
-+                                (_pd_x0 - _pd_sched) * 1000
-+                                if _pd_sched is not None and _pd_x0 is not None
-+                                else None
-+                            ),
-+                            c_forward_ms=(
-+                                (_pd_x1 - _pd_x0) * 1000
-+                                if _pd_x0 is not None and _pd_x1 is not None
-+                                else None
-+                            ),
-+                            d_output_ipc_ms=(
-+                                (_pd_tok - _pd_x1) * 1000
-+                                if _pd_x1 is not None
-+                                else None
-+                            ),
-+                            num_tokens=num_scheduled_tokens.get(
-+                                request.request_id, 0
-+                            ),
-                             engine_total_ms=(
-                                 (_pd_tok - _pd_send) * 1000
-                                 if _pd_send is not None
 diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
-index 7a9049c99..3e70b3423 100644
+index 3e70b3423..c78ac6dce 100644
 --- a/vllm_ascend/worker/model_runner_v1.py
 +++ b/vllm_ascend/worker/model_runner_v1.py
-@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
+@@ -53,7 +53,7 @@ from vllm.distributed.parallel_state import (
  )
  from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
  from vllm.logger import logger
-+from vllm.pd_ttft_trace import PD_TTFT_ENABLED, pd_ttft_now
+-from vllm.pd_ttft_trace import PD_TTFT_ENABLED, pd_ttft_now
++from vllm.pd_ttft_trace import PD_TTFT_ENABLED, pd_ttft_now, pd_ttft_trace
  from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
  from vllm.model_executor.layers.mamba.abstract import MambaBase
  from vllm.model_executor.model_loader import get_model
-@@ -1780,6 +1781,9 @@ class NPUModelRunner(GPUModelRunner):
-         scheduler_output: "SchedulerOutput",
-         intermediate_tensors: IntermediateTensors | None = None,
-     ) -> ModelRunnerOutput | IntermediateTensors | None:
+@@ -1919,6 +1919,10 @@ class NPUModelRunner(GPUModelRunner):
+                     num_scheduled_tokens_np,
+                 )
+ 
++                if PD_TTFT_ENABLED:
++                    # PD_TTFT D11c-1 end: _update_states + _prepare_inputs done.
++                    self._pd_ttft_c1_ts = pd_ttft_now()
++
+                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                 cascade_attn_prefix_lens = None
+                 # Disable cascade attention when using microbatching (DBO)
+@@ -2124,11 +2128,20 @@ class NPUModelRunner(GPUModelRunner):
+                 ),
+             ) as kv_connector_output,
+         ):
++            if PD_TTFT_ENABLED:
++                # PD_TTFT D11c-2 end: set_forward_context + start_load_kv done.
++                # Under DP lockstep this is where a collective can block.
++                self._pd_ttft_c2_ts = pd_ttft_now()
+             if self.cache_config.mamba_cache_mode == "align":
+                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+             hidden_states = self._model_forward(
+                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+             )
++            if PD_TTFT_ENABLED:
++                # PD_TTFT D11c-3 end: forward DISPATCH returned. NPU execution
++                # is async, so real device time surfaces at the later D2H sync,
++                # not here.
++                self._pd_ttft_c3_ts = pd_ttft_now()
+         with record_function_or_nullcontext("post process"):
+             aux_hidden_states = None
+             if self.use_aux_hidden_state_outputs:
+@@ -2197,12 +2210,56 @@ class NPUModelRunner(GPUModelRunner):
+         # previous model forward without breaking async scheduling.
+         if deferred_state_corrections_fn:
+             deferred_state_corrections_fn()
 +        if PD_TTFT_ENABLED:
-+            # PD_TTFT D11b end / D11c start: worker entered execute_model.
-+            self._pd_ttft_exec_start_ts = pd_ttft_now()
-         if vllm_version_is("0.27.1"):
-             if self.vllm_config.model_config.enable_return_routed_experts and self.routed_experts_initialized:
-                 self.routed_experts_capturer.clear_buffer()
-@@ -2359,6 +2363,9 @@ class NPUModelRunner(GPUModelRunner):
-             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-             cudagraph_stats=cudagraph_stats,
-             routed_experts=None,
-+            # PD_TTFT D11c end / D11d start.
-+            pd_ttft_exec_start_ts=getattr(self, "_pd_ttft_exec_start_ts", None),
-+            pd_ttft_exec_done_ts=(pd_ttft_now() if PD_TTFT_ENABLED else None),
++            # PD_TTFT D11c-4 end: post-process + logits done, execute_model
++            # returns. The gap to c5 is executor overhead between the two calls.
++            self._pd_ttft_c4_ts = pd_ttft_now()
+         return None
+ 
+     @torch.inference_mode()
++    def _pd_ttft_emit_split(self, scheduler_output) -> None:
++        """Emit the D11c breakdown (execute_model entry -> output built).
++
++        Gated on a single-token batch so steady-state decode does not flood the
++        log: the decode-side first-token recompute is always num_tokens==1.
++        """
++        if scheduler_output.total_num_scheduled_tokens != 1:
++            return
++        t0 = getattr(self, "_pd_ttft_exec_start_ts", None)
++        c1 = getattr(self, "_pd_ttft_c1_ts", None)
++        c2 = getattr(self, "_pd_ttft_c2_ts", None)
++        c3 = getattr(self, "_pd_ttft_c3_ts", None)
++        c4 = getattr(self, "_pd_ttft_c4_ts", None)
++        c5 = getattr(self, "_pd_ttft_c5_ts", None)
++        if t0 is None:
++            return
++
++        def _ms(a, b):
++            return (b - a) * 1000 if a is not None and b is not None else None
++
++        pd_ttft_trace(
++            "D11c_split",
++            # _update_states + _prepare_inputs (host-side batch build).
++            c1_prepare_ms=_ms(t0, c1),
++            # set_forward_context + start_load_kv; DP-lockstep collectives here.
++            c2_fwd_ctx_ms=_ms(c1, c2),
++            # _model_forward dispatch only (async on NPU).
++            c3_fwd_dispatch_ms=_ms(c2, c3),
++            # post-process + logits, up to execute_model returning.
++            c4_post_ms=_ms(c3, c4),
++            # executor gap between execute_model and sample_tokens.
++            c5_gap_ms=_ms(c4, c5),
++            # sampling + D2H copy: real device time lands here.
++            c6_sample_ms=_ms(c5, pd_ttft_now()),
++            total_ms=_ms(t0, pd_ttft_now()),
++        )
++
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
++        if PD_TTFT_ENABLED:
++            # PD_TTFT D11c-5 start: sample_tokens entered.
++            self._pd_ttft_c5_ts = pd_ttft_now()
+         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
+         kv_connector_output = self.kv_connector_output
+         self.kv_connector_output = None
+@@ -2367,6 +2424,8 @@ class NPUModelRunner(GPUModelRunner):
+             pd_ttft_exec_start_ts=getattr(self, "_pd_ttft_exec_start_ts", None),
+             pd_ttft_exec_done_ts=(pd_ttft_now() if PD_TTFT_ENABLED else None),
          )
++        if PD_TTFT_ENABLED:
++            self._pd_ttft_emit_split(scheduler_output)
          if (
              profiling_chunk_config.enabled
+             and profiling_chunk_config.need_timing
