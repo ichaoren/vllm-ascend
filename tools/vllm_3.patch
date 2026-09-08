@@ -1,0 +1,184 @@
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 8782061356..7cfa59e39f 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -246,6 +246,10 @@ class SchedulerOutput:
+     # KV Cache Connector metadata.
+     kv_connector_metadata: KVConnectorMetadata | None = None
+ 
++    # PD_TTFT D11b start: instant the scheduler finished building this output.
++    # Carried to the worker so the schedule->execute IPC hop is measurable.
++    pd_ttft_schedule_ts: float | None = None
++
+     # EC Cache Connector metadata
+     ec_connector_metadata: ECConnectorMetadata | None = None
+     # EC Cache Manager metadata
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 63c10ed863..1c9246ad12 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -210,6 +211,9 @@ class Scheduler(SchedulerInterface):
+         # PD_TTFT D11: instant remote KV became ready, per request. Only
+         # populated when tracing is on; each entry is popped on first token.
+         self._pd_kv_ready_ts: dict[str, float] = {}
++        # PD_TTFT: req_ids that already emitted D11a, so the per-schedule scan
++        # reports the first batch only.
++        self._pd_d11a_done: set[str] = set()
+         # PD_TTFT D10: when finished_recving landed in the scheduler, waiting
+         # for the next schedule() pass to promote the request.
+         self._pd_recv_signal_ts: dict[str, float] = {}
+@@ -1235,6 +1239,24 @@ class Scheduler(SchedulerInterface):
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+         )
++        if PD_TTFT_ENABLED and self._pd_kv_ready_ts:
++            # PD_TTFT D11b start: carried to the worker process.
++            _pd_sched = pd_ttft_now()
++            scheduler_output.pd_ttft_schedule_ts = _pd_sched
++            for _pd_rid, _pd_promote in self._pd_kv_ready_ts.items():
++                if _pd_rid in self._pd_d11a_done:
++                    continue
++                self._pd_d11a_done.add(_pd_rid)
++                # PD_TTFT D11a: promote -> batch built. num_tokens tells real
++                # compute apart from waiting.
++                pd_ttft_trace(
++                    "D11a_to_batch",
++                    req_id=_pd_rid,
++                    elapsed_ms=(_pd_sched - _pd_promote) * 1000,
++                    num_tokens=num_scheduled_tokens.get(_pd_rid, 0),
++                    batch_total_tokens=total_num_scheduled_tokens,
++                    batch_reqs=len(num_scheduled_tokens),
++                )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+         # 1. Plan the KV cache store
+@@ -1822,16 +1844,38 @@ class Scheduler(SchedulerInterface):
+                     # forward + sampling. Splitting those three needs the
+                     # model runner (second batch).
+                     _pd_ready = self._pd_kv_ready_ts.pop(request.request_id, None)
++                    self._pd_d11a_done.discard(request.request_id)
+                     if _pd_ready is not None:
+                         _pd_tok = pd_ttft_now()
+                         _pd_send = getattr(request, "pd_ttft_send_ts", None)
++                        _pd_sched = getattr(
++                            scheduler_output, "pd_ttft_schedule_ts", None
++                        )
++                        _pd_x0 = model_runner_output.pd_ttft_exec_start_ts
++                        _pd_x1 = model_runner_output.pd_ttft_exec_done_ts
+                         pd_ttft_trace(
+                             "D11_recompute",
+                             req_id=request.request_id,
+                             elapsed_ms=(_pd_tok - _pd_ready) * 1000,
++                            b_sched_to_exec_ms=(
++                                (_pd_x0 - _pd_sched) * 1000
++                                if _pd_sched is not None and _pd_x0 is not None
++                                else None
++                            ),
++                            c_forward_ms=(
++                                (_pd_x1 - _pd_x0) * 1000
++                                if _pd_x0 is not None and _pd_x1 is not None
++                                else None
++                            ),
++                            d_output_ipc_ms=(
++                                (_pd_tok - _pd_x1) * 1000
++                                if _pd_x1 is not None
++                                else None
++                            ),
++                            num_tokens=num_scheduled_tokens.get(
++                                request.request_id, 0
++                            ),
+                             # Engine-internal total: IPC send -> first token.
+-                            # Residual against D4+D5+D5b+D6+D7+D8+D9+D10+D11
+-                            # localizes any remaining gap to inside the engine.
+                             engine_total_ms=(
+                                 (_pd_tok - _pd_send) * 1000
+                                 if _pd_send is not None
+@@ -2341,6 +2385,7 @@ class Scheduler(SchedulerInterface):
+             # PD_TTFT D11: drop the timestamp if the request never emitted a
+             # first token (abort, error) so the dict cannot grow unbounded.
+             self._pd_kv_ready_ts.pop(request.request_id, None)
++        self._pd_d11a_done.discard(request.request_id)
+         if self._pd_recv_signal_ts:
+             self._pd_recv_signal_ts.pop(request.request_id, None)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+@@ -2780,6 +2825,20 @@ class Scheduler(SchedulerInterface):
+         if self.connector is not None:
+             self.connector.update_connector_output(kv_connector_output)
+ 
++        if PD_TTFT_ENABLED and kv_connector_output.finished_recving:
++            # PD_TTFT D9b end: worker collected finished_recving -> the signal
++            # reached the scheduler process. Pure output-IPC + step overhead.
++            _pd_fin = kv_connector_output.pd_ttft_finish_ts
++            pd_ttft_trace(
++                "D9b_output_ipc",
++                num_recving=len(kv_connector_output.finished_recving),
++                elapsed_ms=(
++                    (pd_ttft_now() - _pd_fin) * 1000 if _pd_fin is not None else None
++                ),
++                src="meta" if _pd_fin is not None else "missing",
++                pid=os.getpid(),
++            )
++
+         # KV Connector:: update recv and send status from last step.
+         for req_id in kv_connector_output.finished_recving or ():
+             logger.debug("Finished recving KV transfer for request %s", req_id)
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index abb6a2be0d..2a0d13cbea 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -236,6 +236,10 @@ class KVConnectorOutput:
+     # It captures a static setup info and should almost always remain constant
+     # for a given connector after discovery. Default value entails no change.
+     expected_finished_count: int = 0
++    # PD_TTFT D9b: perf_counter instant at which the worker collected
++    # finished_recving. The scheduler subtracts it on arrival to expose the
++    # worker->EngineCore output-IPC hop, which is a separate process.
++    pd_ttft_finish_ts: float | None = None
+ 
+     def is_empty(self):
+         return (
+@@ -307,6 +311,13 @@ class ModelRunnerOutput:
+     # ``None`` when ``enable_return_routed_experts`` is off.
+     routed_experts: RoutedExpertsLists | None = None
+ 
++    # PD_TTFT D11 split. Stamped in the worker process, read in the scheduler
++    # process, so the two IPC hops around the forward pass separate from the
++    # forward itself: D11b = schedule->execute entry, D11c = execute entry->
++    # output ready (real compute), D11d = output ready->scheduler.
++    pd_ttft_exec_start_ts: float | None = None
++    pd_ttft_exec_done_ts: float | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+index 7a640b875f..5da7c434cc 100644
+--- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
++++ b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
+ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+ from vllm.forward_context import get_forward_context, set_forward_context
+ from vllm.logger import init_logger
++from vllm.pd_ttft_trace import PD_TTFT_ENABLED, pd_ttft_now
+ from vllm.v1.attention.backend import AttentionBackend
+ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+ from vllm.v1.outputs import (
+@@ -102,6 +103,10 @@ class KVConnectorModelRunnerMixin:
+             output.finished_sending, output.finished_recving = (
+                 kv_connector.get_finished(scheduler_output.finished_req_ids)
+             )
++            if PD_TTFT_ENABLED and output.finished_recving:
++                # PD_TTFT D9b start: stamped in the worker process, read in the
++                # scheduler process, so the output-IPC hop becomes visible.
++                output.pd_ttft_finish_ts = pd_ttft_now()
+             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+ 
+             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
