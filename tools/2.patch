@@ -1,0 +1,282 @@
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py
+index 08bd85f08..92c2404d1 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py
+@@ -39,6 +39,13 @@ from vllm.distributed.parallel_state import (
+ )
+ from vllm.distributed.utils import get_pp_indices
+ from vllm.logger import logger
++from vllm.pd_ttft_trace import (
++    PD_TTFT_ENABLED,
++    pd_ttft_now,
++    pd_ttft_pop,
++    pd_ttft_stamp,
++    pd_ttft_trace,
++)
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+ from vllm.v1.core.sched.output import SchedulerOutput
+@@ -102,6 +109,10 @@ class ReqMeta:
+     remote_ptp_size: int | None
+     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
+     num_prompt_blocks: int
++    # PD_TTFT D5b start: scheduler-side block-alloc instant, carried to the
++    # worker through the metadata rather than a module-level dict, which only
++    # bridges hooks living in one process.
++    pd_ttft_alloc_ts: float | None = None
+ 
+ 
+ @dataclass
+@@ -136,6 +147,9 @@ class KVCacheTaskTracker:
+         # be force-freed.
+         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
+         self.reqs_to_process: set[str] = set()
++        # PD_TTFT D9: recv-thread completion timestamps, drained by
++        # get_and_clear_finished_requests().
++        self._pd_done_ts: dict[str, float] = {}
+ 
+     def add_req_to_process(self, request_id: str):
+         self.reqs_to_process.add(request_id)
+@@ -149,6 +163,10 @@ class KVCacheTaskTracker:
+         with self.done_task_lock:
+             if request_id in self.reqs_to_process:
+                 self.finished_requests.add(request_id)
++                if PD_TTFT_ENABLED:
++                    # PD_TTFT D9 start: recv thread is done. The scheduler only
++                    # learns about it at the next get_finished() poll.
++                    self._pd_done_ts[request_id] = pd_ttft_now()
+                 self.reqs_to_process.discard(request_id)
+                 self.delayed_free_requests.pop(request_id, None)
+             else:
+@@ -171,6 +189,18 @@ class KVCacheTaskTracker:
+             expired_requests = self._retrieve_expired_requests()
+             finished_requests.update(expired_requests)
+             self.finished_requests.clear()
++            if self._pd_done_ts:
++                # PD_TTFT D9 end: how long the completion sat in the set before
++                # a forward step got around to polling for it.
++                _pd_poll = pd_ttft_now()
++                for _pd_rid in finished_requests:
++                    _pd_done = self._pd_done_ts.pop(_pd_rid, None)
++                    if _pd_done is not None:
++                        pd_ttft_trace(
++                            "D9_poll_wait",
++                            req_id=_pd_rid,
++                            elapsed_ms=(_pd_poll - _pd_done) * 1000,
++                        )
+         return finished_requests
+ 
+     def add_delayed_request(self, request_id: str, delay_start_time: float):
+@@ -476,14 +506,41 @@ class KVCacheRecvingThread(threading.Thread):
+         tp_num_need_pulls: int,
+         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
+         all_task_done: bool = False,
++        pd_ttft_alloc_ts: float | None = None,
+     ):
+         """Add a new request to the queue for processing."""
+         if remote_port_send_num is None:
+             remote_port_send_num = {}
+         logger.debug("Adding request %s to the queue.", request_id)
++        if PD_TTFT_ENABLED:
++            # PD_TTFT D5b end: the scheduler-side update_state_after_alloc
++            # parked a stamp; the gap to here is the rest of schedule(),
++            # SchedulerOutput build, execute_model entry and start_load_kv.
++            # Same process under UniProcExecutor, so the registry works.
++            # Prefer the metadata-carried stamp, which survives a process hop;
++            # keep the dict as fallback. src= says which one answered, so a
++            # scheduler/worker process split shows up directly in the log.
++            _pd_dict = pd_ttft_pop(f"alloc:{request_id}")
++            _pd_alloc = pd_ttft_alloc_ts if pd_ttft_alloc_ts is not None else _pd_dict
++            pd_ttft_trace(
++                "D5b_to_pull",
++                req_id=request_id,
++                offset=offset,
++                elapsed_ms=(
++                    (pd_ttft_now() - _pd_alloc) * 1000 if _pd_alloc is not None else None
++                ),
++                src=(
++                    "meta"
++                    if pd_ttft_alloc_ts is not None
++                    else ("dict" if _pd_dict is not None else "missing")
++                ),
++                pid=os.getpid(),
++            )
+         self.request_queue.put(
+             {
+                 "request_id": request_id,
++                # PD_TTFT D6: enqueue instant, consumed in _handle_request.
++                "enqueue_ts": pd_ttft_now(),
+                 "local_block_ids": local_block_ids,
+                 "remote_block_ids": remote_block_ids,
+                 "remote_engine_id": remote_engine_id,
+@@ -521,6 +578,8 @@ class KVCacheRecvingThread(threading.Thread):
+ 
+     def _submit_request(self, request_data: dict[str, Any]) -> None:
+         peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
++        # PD_TTFT D6: boundary between the global queue and the per-peer deque.
++        request_data["submit_ts"] = pd_ttft_now()
+         self._mark_request_task_submitted(request_data)
+         should_start_worker = False
+         with self.peer_request_queues_lock:
+@@ -596,6 +655,24 @@ class KVCacheRecvingThread(threading.Thread):
+         remote_port_send_num = req_meta["remote_port_send_num"]
+         all_task_done = req_meta["all_task_done"]
+ 
++        # PD_TTFT D6: split the wait into global-queue vs per-peer-queue time.
++        # A large q_peer_ms concentrated on one peer means the req_id hash in
++        # _get_remote_ranks_for_req skewed requests onto a single P rank.
++        _pd_enq = req_meta.get("enqueue_ts")
++        _pd_sub = req_meta.get("submit_ts")
++        if _pd_enq is not None and _pd_sub is not None:
++            _pd_start = pd_ttft_now()
++            pd_ttft_trace(
++                "D6_pull_queue",
++                req_id=request_id,
++                remote_req_id=remote_request_id,
++                engine=self.local_engine_id,
++                peer=f"{remote_host}:{remote_handshake_port}",
++                q_global_ms=(_pd_sub - _pd_enq) * 1000,
++                q_peer_ms=(_pd_start - _pd_sub) * 1000,
++                elapsed_ms=(_pd_start - _pd_enq) * 1000,
++            )
++
+         try:
+             logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
+             if not self.use_hybrid:
+@@ -660,7 +737,20 @@ class KVCacheRecvingThread(threading.Thread):
+                 and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
+             )
+         if not has_remote_metadata:
++            # PD_TTFT D7: cold-start handshake only. It sits before
++            # req_start_time below, so it is invisible to the existing
++            # "KV cache transfer" log. Exclude requests that emit D7 from
++            # steady-state statistics.
++            _pd_hs = pd_ttft_now()
+             self._get_remote_metadata(remote_host, remote_handshake_port)
++            pd_ttft_trace(
++                "D7_handshake",
++                req_id=req_meta["request_id"],
++                remote_req_id=remote_request_id,
++                engine=self.local_engine_id,
++                peer=f"{remote_host}:{remote_handshake_port}",
++                elapsed_ms=(pd_ttft_now() - _pd_hs) * 1000,
++            )
+         with self.remote_metadata_lock:
+             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
+             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
+@@ -672,6 +762,7 @@ class KVCacheRecvingThread(threading.Thread):
+         for i in range(self.hma_group_size):
+             if not remote_block_ids[i] or not local_block_ids[i]:
+                 continue
++            _pd_desc_start = len(length_list)
+             cur_remote_block_ids = remote_block_ids[i]
+             cur_local_block_ids = local_block_ids[i]
+             if not isinstance(self.kv_cache_specs[i], MambaSpec) and len(cur_local_block_ids) < len(
+@@ -696,6 +787,26 @@ class KVCacheRecvingThread(threading.Thread):
+                     dst_list.append(dst)
+                     length_list.append(length)
+ 
++            if PD_TTFT_ENABLED:
++                # PD_TTFT D8: all groups share one batch_transfer_sync_read, so
++                # per-group time cannot be measured -- only bytes. The compressed
++                # MLA group grows with prompt length; the SWA group is pinned by
++                # get_sw_clipped_blocks.
++                _pd_spec = self.kv_cache_specs[i]
++                if isinstance(_pd_spec, list):
++                    _pd_spec = _pd_spec[0]
++                _pd_group_lens = length_list[_pd_desc_start:]
++                pd_ttft_trace(
++                    "D8_bytes",
++                    req_id=req_meta["request_id"],
++                    remote_req_id=remote_request_id,
++                    group=i,
++                    spec=type(_pd_spec).__name__,
++                    blocks=len(cur_local_block_ids),
++                    descriptors=len(_pd_group_lens),
++                    bytes=sum(_pd_group_lens),
++                )
++
+         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+         if ret < 0:
+             logger.error(
+@@ -715,6 +826,19 @@ class KVCacheRecvingThread(threading.Thread):
+             self.tp_rank,
+             session_id,
+         )
++        # PD_TTFT D8: descriptors alongside bytes -- a high descriptor count at
++        # low bytes means group_concurrent_contiguous merged poorly, which is a
++        # different problem from being bandwidth bound.
++        pd_ttft_trace(
++            "D8_transfer",
++            req_id=req_meta["request_id"],
++            remote_req_id=remote_request_id,
++            engine=self.local_engine_id,
++            peer=f"{remote_host}:{remote_handshake_port}",
++            descriptors=len(length_list),
++            bytes=sum(length_list),
++            elapsed_ms=req_transfer_elapsed,
++        )
+ 
+     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
+         """Handle a KV cache transfer request."""
+@@ -1063,8 +1187,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+         local_block_ids: BlockIds,
+         num_external_tokens: int,
+         kv_transfer_params: dict[str, Any],
++        pd_ttft_alloc_ts: float | None = None,
+     ):
+         self.requests[request_id] = ReqMeta(
++            pd_ttft_alloc_ts=pd_ttft_alloc_ts,
+             local_block_ids=local_block_ids,
+             num_external_tokens=num_external_tokens,
+             remote_block_ids=kv_transfer_params["remote_block_ids"],
+@@ -1377,6 +1503,25 @@ class MooncakeConnectorScheduler:
+                     local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
+                     # Get unhashed blocks to pull from remote.
+                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
++                    _pd_arrival = getattr(request, "pd_ttft_arrival", None)
++                    if _pd_arrival is not None:
++                        # PD_TTFT D4+D5 end: EngineCore input-queue wait plus the
++                        # wait for a schedule() pass that could allocate blocks.
++                        _pd_alloc_done = pd_ttft_now()
++                        pd_ttft_trace(
++                            "D5_first_schedule",
++                            req_id=request.request_id,
++                            elapsed_ms=(_pd_alloc_done - _pd_arrival) * 1000,
++                            num_external_tokens=num_external_tokens,
++                            blocks=len(local_block_ids),
++                            pid=os.getpid(),
++                        )
++                        # PD_TTFT D5b start. Parked on the Request object so
++                        # build_connector_meta can put it into ReqMeta: the
++                        # worker-side hook may live in another process, where a
++                        # module-level dict would silently never match.
++                        request.pd_ttft_alloc_ts = _pd_alloc_done
++                        pd_ttft_stamp(f"alloc:{request.request_id}", _pd_alloc_done)
+                 else:
+                     logger.warning("Got invalid KVTransferParams. params=%s. ", params)
+             else:
+@@ -1401,6 +1546,7 @@ class MooncakeConnectorScheduler:
+                 local_block_ids=block_ids,
+                 num_external_tokens=num_external_tokens,
+                 kv_transfer_params=req.kv_transfer_params,
++                pd_ttft_alloc_ts=getattr(req, "pd_ttft_alloc_ts", None),
+             )
+ 
+         # Clear the list once workers start the transfers
+@@ -1802,6 +1948,7 @@ class MooncakeConnectorWorker:
+                     offset=0,
+                     tp_num_need_pulls=tp_num_need_pulls,
+                     all_task_done=True,
++                    pd_ttft_alloc_ts=getattr(meta, "pd_ttft_alloc_ts", None),
+                 )
+             else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
+                 chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+@@ -1825,6 +1972,7 @@ class MooncakeConnectorWorker:
+                         remote_handshake_port=remote_handshake_port_list[i][0],
+                         offset=i,
+                         tp_num_need_pulls=tp_num_need_pulls,
++                        pd_ttft_alloc_ts=getattr(meta, "pd_ttft_alloc_ts", None),
+                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
+                     )
+ 
