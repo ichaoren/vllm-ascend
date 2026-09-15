@@ -200,9 +200,27 @@ async def replay_one(
         usage = payload.get("usage") or {}
         result["completion_tokens"] = usage.get("completion_tokens")
         result["new_req_id"] = payload.get("id")
+        result["text"] = _extract_text(payload)
     except Exception:  # noqa: BLE001 - unexpected non-json body
         result["completion_tokens"] = None
     return result
+
+
+def _extract_text(payload: dict[str, Any]) -> str:
+    """Pull the generated text out of a non-streaming response.
+
+    Covers both shapes: chat puts it in ``choices[].message.content``, plain
+    completions in ``choices[].text``. Reasoning models may also return
+    ``reasoning_content``, which is included so a garbled reasoning trace is
+    visible too.
+    """
+    out = []
+    for choice in payload.get("choices") or []:
+        message = choice.get("message") or {}
+        for value in (message.get("reasoning_content"), message.get("content"), choice.get("text")):
+            if value:
+                out.append(value)
+    return "".join(out)
 
 
 async def _replay_streaming(
@@ -215,6 +233,7 @@ async def _replay_streaming(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"req_id": rec.get("req_id"), "attempt": attempt, "streamed": True}
     chunks = 0
+    text_parts: list[str] = []
     async with client.stream("POST", api, json=body, timeout=args.timeout) as resp:
         result["status"] = resp.status_code
         if resp.status_code != 200:
@@ -238,29 +257,74 @@ async def _replay_streaming(
             usage = payload.get("usage")
             if usage:
                 result["completion_tokens"] = usage.get("completion_tokens")
+            # Accumulate the incremental text. Chat streams carry it in
+            # choices[].delta, plain completions in choices[].text.
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                for value in (delta.get("reasoning_content"), delta.get("content"), choice.get("text")):
+                    if value:
+                        text_parts.append(value)
     result["chunks"] = chunks
+    result["text"] = "".join(text_parts)
     return result
 
 
-def report_result(result: dict[str, Any], done: int, total: int) -> None:
+def report_result(result: dict[str, Any], done: int, total: int, args: argparse.Namespace) -> None:
     """Print one finished replay immediately.
 
     Called from the worker coroutine rather than after gather(), so progress is
     visible while a long replay is still running. flush=True because stdout is
     block-buffered when redirected to a file, which would otherwise defeat the
     point.
+
+    With ``--show-response`` the generated text is printed underneath the status
+    line, which is how a garbled or truncated generation becomes visible.
     """
     progress = f"[{done}/{total}]"
     if result.get("error"):
+        # A failed request never got an id from the server, so the dumped one is
+        # all there is to identify it by.
         line = f"[FAIL] {progress} {result['req_id']} attempt={result['attempt']} {result['error']}"
     else:
         extra = f" chunks={result['chunks']}" if result.get("streamed") else ""
+        # Only the id the server just assigned: that is what to grep for in the
+        # engine logs for this replay. The dumped id identifies the original
+        # request and is not present on the node any more.
         line = (
-            f"[ OK ] {progress} {result['req_id']} attempt={result['attempt']} "
-            f"status={result['status']} completion_tokens={result.get('completion_tokens')} "
-            f"new_id={result.get('new_req_id')}{extra}"
+            f"[ OK ] {progress} {result.get('new_req_id')} attempt={result['attempt']} "
+            f"status={result['status']} completion_tokens={result.get('completion_tokens')}{extra}"
         )
     print(line, flush=True)
+
+    if args.show_response and not result.get("error"):
+        text = result.get("text") or ""
+        if args.response_chars > 0:
+            shown, clipped = text[: args.response_chars], len(text) > args.response_chars
+        else:
+            shown, clipped = text, False
+        # Indent so the body stays visually attached to its status line even when
+        # several requests are in flight.
+        body = shown if shown else "(empty response)"
+        for text_line in body.splitlines() or [""]:
+            _print_safe(f"       | {text_line}")
+        if clipped:
+            print(f"       | ... [{len(text) - args.response_chars} more chars]", flush=True)
+
+
+def _print_safe(line: str) -> None:
+    """Print a line of model output without letting encoding kill the replay.
+
+    Generated text is arbitrary, and a character the terminal's encoding cannot
+    represent would raise UnicodeEncodeError. That exception would propagate out
+    of the worker coroutine and abort every remaining request, so unrepresentable
+    characters are escaped instead. This matters most when the generation is
+    garbled, which is exactly what this flag is for.
+    """
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(line.encode(encoding, errors="backslashreplace").decode(encoding), flush=True)
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -295,7 +359,7 @@ async def run(args: argparse.Namespace) -> int:
             # it finishes. Coroutines on one event loop do not interleave between
             # these two statements, so the counter needs no lock.
             done += 1
-            report_result(result, done, total)
+            report_result(result, done, total, args)
             return result
 
         tasks = [
@@ -332,6 +396,17 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1, help="replay each request this many times")
     parser.add_argument("--concurrency", type=int, default=1, help="max in-flight requests")
     parser.add_argument("--timeout", type=float, default=600.0, help="per-request timeout in seconds")
+    parser.add_argument(
+        "--show-response",
+        action="store_true",
+        help="print the generated text under each status line (off by default)",
+    )
+    parser.add_argument(
+        "--response-chars",
+        type=int,
+        default=500,
+        help="truncate each shown response to this many characters (0 = no limit)",
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,
