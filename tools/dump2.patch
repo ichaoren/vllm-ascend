@@ -1,0 +1,203 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index c1aec9a979..0950c05ebe 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -49,7 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     UsageInfo,
+ )
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+-from vllm.entrypoints.openai.request_dump import dump_enabled, dump_request
++from vllm.entrypoints.openai.request_dump import dump_enabled, dump_raw_request
+ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.entrypoints.serve.utils.tool_calls_utils import (
+@@ -264,6 +264,13 @@ class OpenAIServingChat(GenerateBaseServing):
+         if raw_request:
+             raw_request.state.request_metadata = request_metadata
+ 
++        if dump_enabled():
++            # One line per incoming HTTP request, matching the proxy dump. Sub
++            # requests for multi-prompt inputs share this one body.
++            await dump_raw_request(
++                request_id, "/chat/completions", raw_request, request
++            )
++
+         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+ 
+         model_name = self.models.model_name(lora_request)
+@@ -285,14 +292,6 @@ class OpenAIServingChat(GenerateBaseServing):
+                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
+             )
+ 
+-            if dump_enabled():
+-                # exclude_unset keeps the dump close to what the client actually
+-                # sent instead of filling in every schema default.
+-                dump_request(
+-                    sub_request_id,
+-                    "/chat/completions",
+-                    request.model_dump(exclude_unset=True, mode="json"),
+-                )
+ 
+             max_tokens = get_max_tokens(
+                 max_model_len,
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 441c653ff5..d2a8ad043c 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -36,7 +36,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     UsageInfo,
+ )
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+-from vllm.entrypoints.openai.request_dump import dump_enabled, dump_request
++from vllm.entrypoints.openai.request_dump import dump_enabled, dump_raw_request
+ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.exceptions import VLLMValidationError
+@@ -149,13 +149,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         created_time = int(time.time())
+ 
+         if dump_enabled():
+-            # exclude_unset keeps the dump close to what the client actually sent
+-            # instead of filling in every schema default.
+-            dump_request(
+-                request_id,
+-                "/completions",
+-                request.model_dump(exclude_unset=True, mode="json"),
+-            )
++            await dump_raw_request(request_id, "/completions", raw_request, request)
+ 
+         request_metadata = RequestResponseMetadata(request_id=request_id)
+         if raw_request:
+diff --git a/vllm/entrypoints/openai/request_dump.py b/vllm/entrypoints/openai/request_dump.py
+index eab2a80e67..9d1157ba51 100644
+--- a/vllm/entrypoints/openai/request_dump.py
++++ b/vllm/entrypoints/openai/request_dump.py
+@@ -48,6 +48,40 @@ def dump_enabled() -> bool:
+     return bool(DUMP_REQ_PATH) and not _dump_done
+ 
+ 
++async def dump_raw_request(
++    req_id: str, api: str, raw_request: Any, request: Any
++) -> None:
++    """Dump the body exactly as the client sent it.
++
++    The raw JSON is used rather than ``request.model_dump()`` because a dump has
++    to stay re-postable, and re-serializing through the pydantic model is lossy:
++    ``tool_calls[].function.arguments`` is typed ``str`` (OpenAI sends it
++    JSON-encoded), but model_dump emits the parsed object, so the result fails
++    re-validation with "Input should be a valid string".
++
++    Starlette caches the body once read, and FastAPI has already read it to
++    validate the model, so this does not re-consume the stream.
++
++    Falls back to model_dump when there is no raw request (offline / batch entry
++    points), which is lossy in the way described above but better than nothing.
++    """
++    body: dict[str, Any] | None = None
++    try:
++        if raw_request is not None:
++            body = await raw_request.json()
++    except Exception as e:  # noqa: BLE001 - fall through to model_dump
++        logger.warning(
++            "Could not read raw body for %s (%s); using model_dump", req_id, e
++        )
++    if body is None:
++        try:
++            body = request.model_dump(exclude_unset=True, mode="json")
++        except Exception as e:  # noqa: BLE001 - debugging aid must not break serving
++            logger.warning("Failed to serialize request %s: %s", req_id, e)
++            return
++    dump_request(req_id, api, body)
++
++
+ def dump_request(req_id: str, api: str, body: dict[str, Any]) -> None:
+     """Append one request to the dump file, keyed by req_id.
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b4521a2e19..4aad599d97 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -65,6 +66,15 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++# Set VLLM_LOG_SPEC_ACCEPT=1 to log one line per finished request with its
++# speculative-decoding acceptance rate and acceptance length. The SpecDecoding
++# metrics line is aggregated over all requests, so a global "acceptance rate
++# 0.0%" cannot be attributed to individual requests; this fills that gap.
++# Hooked on the base Scheduler so every subclass (AsyncScheduler and the
++# vllm-ascend variants) is covered. Requires log stats to be enabled, because
++# make_spec_decoding_stats returns early without them.
++LOG_SPEC_ACCEPT = bool(int(os.getenv("VLLM_LOG_SPEC_ACCEPT", "0")))
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -246,6 +256,9 @@ class Scheduler(SchedulerInterface):
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
+         self.num_lookahead_tokens = 0
+         self.dynamic_sd_lookup: list[int] | None = None
++        # Per-request speculative-decoding accept counters, keyed by request id.
++        # Only populated when LOG_SPEC_ACCEPT is set; see _log_spec_accept.
++        self._spec_accept: dict[str, list[int]] = {}
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+@@ -2302,6 +2315,11 @@ class Scheduler(SchedulerInterface):
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
+ 
++        if LOG_SPEC_ACCEPT:
++            # Reached by both normally finished and aborted requests, so this is
++            # the single complete flush point for the per-request stats.
++            self._log_spec_accept(request.request_id)
++
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+ 
+@@ -2547,8 +2565,37 @@ class Scheduler(SchedulerInterface):
+         spec_decoding_stats.observe_draft(
+             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+         )
++        if LOG_SPEC_ACCEPT:
++            # Accumulated after the num_invalid_spec_tokens deduction above, so
++            # tokens dropped by structured output are not counted as rejected.
++            # [num_drafts, num_draft_tokens, num_accepted_tokens]
++            per_req = self._spec_accept.setdefault(request_id, [0, 0, 0])
++            per_req[0] += 1
++            per_req[1] += num_draft_tokens
++            per_req[2] += num_accepted_tokens
+         return spec_decoding_stats
+ 
++    def _log_spec_accept(self, request_id: str) -> None:
++        """Log one request's speculative-decoding acceptance stats and drop them."""
++        stats = self._spec_accept.pop(request_id, None)
++        if stats is None:
++            # The request never went through speculative decoding (e.g. it only
++            # ran a prefill step, or spec decode was skipped for it).
++            return
++        num_drafts, num_draft_tokens, num_accepted = stats
++        logger.info(
++            "SpecAccept per request: req_id=%s drafts=%d draft_tokens=%d accepted=%d "
++            "accept_rate=%.3f accept_len=%.2f",
++            request_id,
++            num_drafts,
++            num_draft_tokens,
++            num_accepted,
++            num_accepted / num_draft_tokens if num_draft_tokens else 0.0,
++            # Includes the bonus token, matching "Mean acceptance length" in the
++            # aggregated SpecDecoding metrics line.
++            1 + num_accepted / num_drafts if num_drafts else 0.0,
++        )
++
+     def shutdown(self) -> None:
+         logger.debug_once("[shutdown] Scheduler: start")
+         if self.kv_event_publisher:
