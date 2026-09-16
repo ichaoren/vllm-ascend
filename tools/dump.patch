@@ -1,0 +1,146 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 7b3ce551b2..c1aec9a979 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     UsageInfo,
+ )
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
++from vllm.entrypoints.openai.request_dump import dump_enabled, dump_request
+ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.entrypoints.serve.utils.tool_calls_utils import (
+@@ -284,6 +285,15 @@ class OpenAIServingChat(GenerateBaseServing):
+                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
+             )
+ 
++            if dump_enabled():
++                # exclude_unset keeps the dump close to what the client actually
++                # sent instead of filling in every schema default.
++                dump_request(
++                    sub_request_id,
++                    "/chat/completions",
++                    request.model_dump(exclude_unset=True, mode="json"),
++                )
++
+             max_tokens = get_max_tokens(
+                 max_model_len,
+                 request.max_completion_tokens
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 8791042c69..441c653ff5 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -36,6 +36,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     UsageInfo,
+ )
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
++from vllm.entrypoints.openai.request_dump import dump_enabled, dump_request
+ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.exceptions import VLLMValidationError
+@@ -147,6 +148,15 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+         created_time = int(time.time())
+ 
++        if dump_enabled():
++            # exclude_unset keeps the dump close to what the client actually sent
++            # instead of filling in every schema default.
++            dump_request(
++                request_id,
++                "/completions",
++                request.model_dump(exclude_unset=True, mode="json"),
++            )
++
+         request_metadata = RequestResponseMetadata(request_id=request_id)
+         if raw_request:
+             raw_request.state.request_metadata = request_metadata
+diff --git a/vllm/entrypoints/openai/request_dump.py b/vllm/entrypoints/openai/request_dump.py
+new file mode 100644
+index 0000000000..eab2a80e67
+--- /dev/null
++++ b/vllm/entrypoints/openai/request_dump.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Append incoming OpenAI requests to a JSONL file for later replay.
++
++Set ``VLLM_DUMP_REQ_PATH`` to a directory and every request handled by the chat
++or completions endpoint is appended to ``<dir>/requests_<pid>.jsonl`` as::
++
++    {"req_id": "chatcmpl-<uuid>", "api": "/chat/completions", "body": {...}}
++
++The format matches the dump produced by the disaggregated-prefill proxy example
++(``load_balance_proxy_server_example.py``), so files from a colocated deployment
++and from a P/D-disaggregated one can be replayed by the same script
++(``examples/disaggregated_prefill_v1/replay_spec_reject.py`` in vllm-ascend).
++Notably ``api`` is stored backend-relative (``/chat/completions``, without the
++``/v1`` prefix), which is what the proxy stores; the replay script maps it back
++onto the public route.
++
++Collection stops after ``VLLM_DUMP_REQ_LIMIT`` requests (default 1000) so a
++long-running service cannot fill the disk. The cap is per process, so with
++``--api_server_count N`` the dump holds at most N * limit requests.
++
++Disabled unless the env var is set, in which case the cost is one module-level
++truth test per request.
++"""
++
++import json
++import os
++import threading
++from pathlib import Path
++from typing import Any
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++DUMP_REQ_PATH = os.getenv("VLLM_DUMP_REQ_PATH")
++DUMP_REQ_LIMIT = int(os.getenv("VLLM_DUMP_REQ_LIMIT", "1000"))
++
++_dump_file: Any = None
++_dump_lock = threading.Lock()
++_dump_count = 0
++# Flipped once the cap is reached so the serving path stops calling in.
++_dump_done = False
++
++
++def dump_enabled() -> bool:
++    """True while requests should still be dumped."""
++    return bool(DUMP_REQ_PATH) and not _dump_done
++
++
++def dump_request(req_id: str, api: str, body: dict[str, Any]) -> None:
++    """Append one request to the dump file, keyed by req_id.
++
++    Best-effort: a dump failure must never break request serving, so all
++    exceptions are swallowed after a single warning.
++    """
++    global _dump_file, _dump_count, _dump_done
++    try:
++        record = {"req_id": req_id, "api": api, "body": body}
++        line = json.dumps(record, ensure_ascii=False)
++        with _dump_lock:
++            if _dump_done:
++                return
++            if _dump_file is None:
++                path = Path(DUMP_REQ_PATH)  # type: ignore[arg-type]
++                path.mkdir(parents=True, exist_ok=True)
++                # One file per API server process; they do not share memory.
++                dump_path = path / f"requests_{os.getpid()}.jsonl"
++                _dump_file = dump_path.open("a", encoding="utf-8")
++                logger.warning(
++                    "Dumping up to %d requests to %s", DUMP_REQ_LIMIT, dump_path
++                )
++            # Single write of a newline-terminated string keeps lines intact.
++            _dump_file.write(line + "\n")
++            _dump_file.flush()
++            _dump_count += 1
++            if _dump_count >= DUMP_REQ_LIMIT:
++                _dump_done = True
++                _dump_file.close()
++                logger.warning(
++                    "Request dump limit (%d) reached, stopping", DUMP_REQ_LIMIT
++                )
++    except Exception as e:  # noqa: BLE001 - debugging aid must not break serving
++        logger.warning("Failed to dump request %s: %s", req_id, e)
