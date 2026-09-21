@@ -1,3 +1,11 @@
+ # 只看 miss 归因(开销可忽略,可长期开)
+  grep "DIAG.*miss causes" logs/v4_flash_d.log | tail -3
+
+  # 验证签名正确性(跑几百 step 即可,之后关掉)
+  VLLM_ASCEND_DSA_SAS_AUDIT=1 bash scripts/decode.sh
+  grep "DIAG.*audit\|MISMATCH" logs/v4_flash_d.log
+
+
 self._c1_sas_cache_misses = 0
         # BEGIN TEMPORARY DIAGNOSTICS -- delete with the _diag_* methods below.
         self._diag_prev_signature: _A5C1SASSignature | None = None
@@ -150,3 +158,5 @@ if sas_metadata is None and sas_signature is not None:
                 # BEGIN TEMPORARY DIAGNOSTICS
                 self._diag_record_miss(sas_signature)
                 # END TEMPORARY DIAGNOSTICS
+
+
