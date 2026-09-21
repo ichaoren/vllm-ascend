@@ -1,166 +1,152 @@
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.logger import logger
-
-def get_dspark_sparse_sas_window(vllm_config: Any) -> tuple[int, int]:
-    hf_config = vllm_config.model_config.hf_config
-    window_size = int(hf_config.sliding_window)
-    block_size = vllm_config.speculative_config.num_speculative_tokens
-    return window_size + block_size - 1, 0
-
-
-_A5C1SASSignature: TypeAlias = tuple[tuple[int, int], ...]
-
-
-def _build_a5_c1_sas_signature(
-    query_start_loc_cpu: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    num_reqs: int,
-) -> _A5C1SASSignature | None:
-    """Build the A5 c1 SAS scheduling signature from CPU metadata.
-
-    With A5, 128-token sliding-window attention and at most 16 query
-    tokens per request, each query row has one S2 block. The AICPU
-    scheduler only distinguishes whether that row has at most 64 valid
-    tokens, so ``(query_len, num_short_rows)`` fully describes one
-    request's scheduling cost while preserving request order.
-
-    Two steps with the same signature therefore produce byte-identical SAS
-    metadata, which lets the caller skip the AI_CPU rebuild. In steady-state
-    decode every request has ``context_len >= 64`` so ``num_short_rows`` is 0
-    and the signature stops changing with sequence length.
-
-    Return ``None`` for inputs outside the proven cacheable domain so the
-    caller falls back to rebuilding metadata.
-    """
-    if num_reqs < 0 or query_start_loc_cpu.device.type != "cpu" or seq_lens_cpu.device.type != "cpu":
-        return None
-    if query_start_loc_cpu.numel() < num_reqs + 1 or seq_lens_cpu.numel() < num_reqs:
-        return None
-
-    query_lens = (query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]).tolist()
-    seq_lens = seq_lens_cpu[:num_reqs].tolist()
-    signature: list[tuple[int, int]] = []
-    for query_len_raw, seq_len_raw in zip(query_lens, seq_lens, strict=True):
-        query_len = int(query_len_raw)
-        seq_len = int(seq_len_raw)
-        if query_len == 0:
-            signature.append((0, 0))
-            continue
-        if query_len < 0 or query_len > 16 or seq_len < query_len:
-            return None
-
-        context_len = seq_len - query_len
-        num_short_rows = min(max(64 - context_len, 0), query_len)
-        signature.append((query_len, num_short_rows))
-    return tuple(signature)
+self._c1_sas_cache_misses = 0
+        # BEGIN TEMPORARY DIAGNOSTICS -- delete with the _diag_* methods below.
+        self._diag_prev_signature: _A5C1SASSignature | None = None
+        self._diag_miss_cold = 0
+        self._diag_miss_batch_resize = 0
+        self._diag_miss_ramping = 0
+        self._diag_audit_checked = 0
+        self._diag_audit_mismatches = 0
+        # END TEMPORARY DIAGNOSTICS
 
 
 
-
-
-self.common_ratio_to_sas_metadata: dict | None = None
-        self.seq_lens: torch.Tensor = None
-
-        self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
-        # Cross-step SAS metadata reuse. The signature's equivalence proof only
-        # covers the A5 c1 (uncompressed sliding-window) path: 128-token window,
-        # one S2 block per query row, 64/128 Q heads. c4/c128 tiling also depends
-        # on the compressed cache, so they keep rebuilding every step.
-        #
-        # NOTE: compressor state-cache builders also land here with
-        # compressor_ratio == 1, because compressor.py builds its spec without
-        # passing compress_ratio and takes the dataclass default of 1. That is
-        # harmless: every ratio-1 builder shares the "c1" key in the per-step
-        # metadata_cache, so only the first one in group order (the real SWA
-        # attention group) ever reaches the operator call and populates this
-        # cache -- the rest hit the per-step entry and return before it.
-        hf_config = self.model_config.hf_config
-        self._a5_c1_sas_cache_enabled = (
-            get_ascend_device_type() == AscendDeviceType.A5
-            and self.compressor_ratio <= 1
-            and getattr(hf_config, "sliding_window", None) == 128
-            and getattr(hf_config, "num_attention_heads", None) in {64, 128}
-        )
-        self._c1_sas_cache_signature: _A5C1SASSignature | None = None
-        self._c1_sas_cache_metadata: torch.Tensor | None = None
-        self._c1_sas_cache_hits = 0
-        self._c1_sas_cache_misses = 0
-
-
-
-
-
-hadamard=AscendDSAMetadataBuilder.hadamard,
-        )
-
-    def _record_c1_sas_cache_lookup(self, hit: bool) -> None:
-        if hit:
-            self._c1_sas_cache_hits += 1
-        else:
-            self._c1_sas_cache_misses += 1
-
-        total = self._c1_sas_cache_hits + self._c1_sas_cache_misses
-        if total == 1 or total % 1000 == 0:
-            logger.info(
-                "DSA A5 c1 SAS cache: hits=%d, misses=%d, hit_rate=%.2f%%",
-                self._c1_sas_cache_hits,
-                self._c1_sas_cache_misses,
-                self._c1_sas_cache_hits * 100.0 / total,
-            )
-
-    def get_c1_sas_cache_stats(self) -> tuple[int, int]:
+def get_c1_sas_cache_stats(self) -> tuple[int, int]:
         """Return cross-step c1 SAS cache hits and misses."""
         return self._c1_sas_cache_hits, self._c1_sas_cache_misses
 
+    # ---------------------------------------------------------------------
+    # BEGIN TEMPORARY DIAGNOSTICS -- c1 SAS cache validation. Delete this
+    # whole block (and its two call sites, both marked with the same
+    # TEMPORARY DIAGNOSTICS banner) once validation is done.
+    #
+    # Two questions this answers:
+    #   1. Why do the residual ~5.5% of lookups miss? Env: always on, logged
+    #      every 1000 misses.  VLLM_ASCEND_DSA_SAS_MISS_LOG=0 to silence.
+    #   2. Is the signature under-specified? The operator output is reused
+    #      across steps even though max_seqlen_kv / seqused_kv / cu_seqlens_ori_kv
+    #      all change every step. Env: VLLM_ASCEND_DSA_SAS_AUDIT=1 recomputes
+    #      on every hit and byte-compares. Expensive -- validation only.
+    # ---------------------------------------------------------------------
 
+    def _diag_record_miss(self, sas_signature: _A5C1SASSignature) -> None:
+        """Attribute a miss to a cause so the residual miss rate can be judged.
 
+        ``batch_resize`` (request count changed) is inherent to scheduling.
+        ``ramping`` means the request set is stable but some request still has
+        ``context_len < 64``, so its ``num_short_rows`` is non-zero and settles
+        on its own as the sequence grows. A ``ramping`` share that never decays
+        would mean the signature churns for some other reason.
+        """
+        previous = self._diag_prev_signature
+        self._diag_prev_signature = sas_signature
+        if previous is None:
+            self._diag_miss_cold += 1
+        elif len(previous) != len(sas_signature):
+            self._diag_miss_batch_resize += 1
+        else:
+            self._diag_miss_ramping += 1
 
-cu_seqlens_ori_kv: torch.Tensor | None,
+        total = self._diag_miss_cold + self._diag_miss_batch_resize + self._diag_miss_ramping
+        if total % 1000 == 0 and os.getenv("VLLM_ASCEND_DSA_SAS_MISS_LOG", "1") == "1":
+            logger.info(
+                "[DIAG] c1 SAS miss causes: cold=%d batch_resize=%d ramping=%d "
+                "(last_sig_len=%d, sample=%s)",
+                self._diag_miss_cold,
+                self._diag_miss_batch_resize,
+                self._diag_miss_ramping,
+                len(sas_signature),
+                sas_signature[:4],
+            )
+
+    def _diag_audit_cache_hit(
+        self,
+        cached: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seqlen_q: int | torch.Tensor,
+        max_seqlen_kv: int | torch.Tensor,
+        cu_seqlens_ori_kv: torch.Tensor | None,
         cu_seqlens_cmp_kv: torch.Tensor | None,
-        sas_signature: _A5C1SASSignature | None = None,
-    ) -> torch.Tensor:
-        sas_metadata = metadata_cache.get(layer_name)
-        # Cross-step reuse: a matching signature means the AI_CPU scheduler would
-        # emit identical metadata, so skip the rebuild entirely. Only consulted
-        # when the per-step cache missed, and only on the proven c1 path.
-        if sas_metadata is None and sas_signature is not None:
+    ) -> None:
+        """Recompute the metadata from THIS step's inputs and byte-compare.
+
+        Guards the one assumption the signature does not encode: that the
+        operator output is invariant to max_seqlen_kv / seqused_kv /
+        cu_seqlens_ori_kv within the proven domain. Rebuilding with the current
+        (changed) inputs is the whole point -- reusing the kwargs captured when
+        the cache was filled would compare the op against itself and pass
+        vacuously.
+        """
+        if os.getenv("VLLM_ASCEND_DSA_SAS_AUDIT", "0") != "1":
+            return
+        tp_size = get_tensor_model_parallel_world_size()
+        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
+        fresh = metadata_op(
+            **DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device),
+            num_heads_q=self.model_config.hf_config.num_attention_heads // tp_size,
+            num_heads_kv=1,
+            head_dim=self.model_config.get_head_size(),
+            cu_seqlens_q=query_start_loc,
+            cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+            seqused_q=self.seqused_q,
+            seqused_kv=seq_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=len(seq_lens),
+            cmp_topk=0,
+            cmp_ratio=1,
+            ori_mask_mode=4,
+            cmp_mask_mode=3,
+            ori_win_left=self.model_config.hf_config.sliding_window - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            has_ori_kv=True,
+            has_cmp_kv=False,
+        )
+        self._diag_audit_checked += 1
+        if not torch.equal(fresh, cached):
+            self._diag_audit_mismatches += 1
+            diff = (fresh != cached).nonzero().flatten()[:8].tolist()
+            logger.error(
+                "[DIAG] c1 SAS cache MISMATCH #%d of %d checked -- signature is "
+                "under-specified. First differing indices=%s fresh=%s cached=%s",
+                self._diag_audit_mismatches,
+                self._diag_audit_checked,
+                diff,
+                [int(fresh[i]) for i in diff],
+                [int(cached[i]) for i in diff],
+            )
+        elif self._diag_audit_checked % 1000 == 0:
+            logger.info(
+                "[DIAG] c1 SAS audit: %d hits byte-verified, %d mismatches",
+                self._diag_audit_checked,
+                self._diag_audit_mismatches,
+            )
+
+    # END TEMPORARY DIAGNOSTICS
+    # ---------------------------------------------------------------------
+
+
+if sas_metadata is None and sas_signature is not None:
             if self._c1_sas_cache_metadata is not None and self._c1_sas_cache_signature == sas_signature:
                 self._record_c1_sas_cache_lookup(hit=True)
                 sas_metadata = self._c1_sas_cache_metadata
                 metadata_cache[layer_name] = sas_metadata
+                # BEGIN TEMPORARY DIAGNOSTICS -- no-op unless the audit env var is set.
+                self._diag_audit_cache_hit(
+                    sas_metadata,
+                    query_start_loc,
+                    seq_lens,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    cu_seqlens_ori_kv,
+                    cu_seqlens_cmp_kv,
+                )
+                # END TEMPORARY DIAGNOSTICS
             else:
                 self._record_c1_sas_cache_lookup(hit=False)
-
-has_cmp_kv=self.compressor_ratio > 1,
-            )
-metadata_cache[layer_name] = sas_metadata
-            if sas_signature is not None:
-                self._c1_sas_cache_signature = sas_signature
-                self._c1_sas_cache_metadata = sas_metadata
-
-preamble = (
-                torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item(),
-                torch.max(seq_lens_cpu[:num_reqs]).item(),
-                seq_lens - seq_lens_q,
-                # Signature for cross-step SAS reuse. Group-invariant like the
-                # rest of the preamble, so build it once; whether it is *used*
-                # is decided per group below.
-                _build_a5_c1_sas_signature(
-                    common_attn_metadata.query_start_loc_cpu, seq_lens_cpu, num_reqs
-                ),
-            )
-            self.common_ratio_to_sas_metadata["req_preamble"] = preamble
-        max_seqlen_q, max_seqlen_kv, start_pos, sas_signature = preamble
-        has_prefill = self.num_prefills > 0
-
-
-
-
-cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-            # Prefill changes the mask layout, and the equivalence proof only
-            # covers c1, so gate reuse on both.
-            sas_signature=(
-                sas_signature if self._a5_c1_sas_cache_enabled and not has_prefill else None
-            ),
-        )
+                # BEGIN TEMPORARY DIAGNOSTICS
+                self._diag_record_miss(sas_signature)
+                # END TEMPORARY DIAGNOSTICS
