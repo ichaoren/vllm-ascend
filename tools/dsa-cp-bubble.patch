@@ -131,6 +131,8 @@ cu_seqlens_ori_kv: torch.Tensor | None,
             else:
                 self._record_c1_sas_cache_lookup(hit=False)
 
+has_cmp_kv=self.compressor_ratio > 1,
+            )
 metadata_cache[layer_name] = sas_metadata
             if sas_signature is not None:
                 self._c1_sas_cache_signature = sas_signature
