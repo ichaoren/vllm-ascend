@@ -131,7 +131,10 @@ cu_seqlens_ori_kv: torch.Tensor | None,
             else:
                 self._record_c1_sas_cache_lookup(hit=False)
 
-
+metadata_cache[layer_name] = sas_metadata
+            if sas_signature is not None:
+                self._c1_sas_cache_signature = sas_signature
+                self._c1_sas_cache_metadata = sas_metadata
 
 preamble = (
                 torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item(),
