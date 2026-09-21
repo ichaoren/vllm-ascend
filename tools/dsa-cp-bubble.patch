@@ -1,0 +1,161 @@
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import logger
+
+def get_dspark_sparse_sas_window(vllm_config: Any) -> tuple[int, int]:
+    hf_config = vllm_config.model_config.hf_config
+    window_size = int(hf_config.sliding_window)
+    block_size = vllm_config.speculative_config.num_speculative_tokens
+    return window_size + block_size - 1, 0
+
+
+_A5C1SASSignature: TypeAlias = tuple[tuple[int, int], ...]
+
+
+def _build_a5_c1_sas_signature(
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_reqs: int,
+) -> _A5C1SASSignature | None:
+    """Build the A5 c1 SAS scheduling signature from CPU metadata.
+
+    With A5, 128-token sliding-window attention and at most 16 query
+    tokens per request, each query row has one S2 block. The AICPU
+    scheduler only distinguishes whether that row has at most 64 valid
+    tokens, so ``(query_len, num_short_rows)`` fully describes one
+    request's scheduling cost while preserving request order.
+
+    Two steps with the same signature therefore produce byte-identical SAS
+    metadata, which lets the caller skip the AI_CPU rebuild. In steady-state
+    decode every request has ``context_len >= 64`` so ``num_short_rows`` is 0
+    and the signature stops changing with sequence length.
+
+    Return ``None`` for inputs outside the proven cacheable domain so the
+    caller falls back to rebuilding metadata.
+    """
+    if num_reqs < 0 or query_start_loc_cpu.device.type != "cpu" or seq_lens_cpu.device.type != "cpu":
+        return None
+    if query_start_loc_cpu.numel() < num_reqs + 1 or seq_lens_cpu.numel() < num_reqs:
+        return None
+
+    query_lens = (query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]).tolist()
+    seq_lens = seq_lens_cpu[:num_reqs].tolist()
+    signature: list[tuple[int, int]] = []
+    for query_len_raw, seq_len_raw in zip(query_lens, seq_lens, strict=True):
+        query_len = int(query_len_raw)
+        seq_len = int(seq_len_raw)
+        if query_len == 0:
+            signature.append((0, 0))
+            continue
+        if query_len < 0 or query_len > 16 or seq_len < query_len:
+            return None
+
+        context_len = seq_len - query_len
+        num_short_rows = min(max(64 - context_len, 0), query_len)
+        signature.append((query_len, num_short_rows))
+    return tuple(signature)
+
+
+
+
+
+self.common_ratio_to_sas_metadata: dict | None = None
+        self.seq_lens: torch.Tensor = None
+
+        self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
+        # Cross-step SAS metadata reuse. The signature's equivalence proof only
+        # covers the A5 c1 (uncompressed sliding-window) path: 128-token window,
+        # one S2 block per query row, 64/128 Q heads. c4/c128 tiling also depends
+        # on the compressed cache, so they keep rebuilding every step.
+        #
+        # NOTE: compressor state-cache builders also land here with
+        # compressor_ratio == 1, because compressor.py builds its spec without
+        # passing compress_ratio and takes the dataclass default of 1. That is
+        # harmless: every ratio-1 builder shares the "c1" key in the per-step
+        # metadata_cache, so only the first one in group order (the real SWA
+        # attention group) ever reaches the operator call and populates this
+        # cache -- the rest hit the per-step entry and return before it.
+        hf_config = self.model_config.hf_config
+        self._a5_c1_sas_cache_enabled = (
+            get_ascend_device_type() == AscendDeviceType.A5
+            and self.compressor_ratio <= 1
+            and getattr(hf_config, "sliding_window", None) == 128
+            and getattr(hf_config, "num_attention_heads", None) in {64, 128}
+        )
+        self._c1_sas_cache_signature: _A5C1SASSignature | None = None
+        self._c1_sas_cache_metadata: torch.Tensor | None = None
+        self._c1_sas_cache_hits = 0
+        self._c1_sas_cache_misses = 0
+
+
+
+
+
+hadamard=AscendDSAMetadataBuilder.hadamard,
+        )
+
+    def _record_c1_sas_cache_lookup(self, hit: bool) -> None:
+        if hit:
+            self._c1_sas_cache_hits += 1
+        else:
+            self._c1_sas_cache_misses += 1
+
+        total = self._c1_sas_cache_hits + self._c1_sas_cache_misses
+        if total == 1 or total % 1000 == 0:
+            logger.info(
+                "DSA A5 c1 SAS cache: hits=%d, misses=%d, hit_rate=%.2f%%",
+                self._c1_sas_cache_hits,
+                self._c1_sas_cache_misses,
+                self._c1_sas_cache_hits * 100.0 / total,
+            )
+
+    def get_c1_sas_cache_stats(self) -> tuple[int, int]:
+        """Return cross-step c1 SAS cache hits and misses."""
+        return self._c1_sas_cache_hits, self._c1_sas_cache_misses
+
+
+
+
+cu_seqlens_ori_kv: torch.Tensor | None,
+        cu_seqlens_cmp_kv: torch.Tensor | None,
+        sas_signature: _A5C1SASSignature | None = None,
+    ) -> torch.Tensor:
+        sas_metadata = metadata_cache.get(layer_name)
+        # Cross-step reuse: a matching signature means the AI_CPU scheduler would
+        # emit identical metadata, so skip the rebuild entirely. Only consulted
+        # when the per-step cache missed, and only on the proven c1 path.
+        if sas_metadata is None and sas_signature is not None:
+            if self._c1_sas_cache_metadata is not None and self._c1_sas_cache_signature == sas_signature:
+                self._record_c1_sas_cache_lookup(hit=True)
+                sas_metadata = self._c1_sas_cache_metadata
+                metadata_cache[layer_name] = sas_metadata
+            else:
+                self._record_c1_sas_cache_lookup(hit=False)
+
+
+
+preamble = (
+                torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item(),
+                torch.max(seq_lens_cpu[:num_reqs]).item(),
+                seq_lens - seq_lens_q,
+                # Signature for cross-step SAS reuse. Group-invariant like the
+                # rest of the preamble, so build it once; whether it is *used*
+                # is decided per group below.
+                _build_a5_c1_sas_signature(
+                    common_attn_metadata.query_start_loc_cpu, seq_lens_cpu, num_reqs
+                ),
+            )
+            self.common_ratio_to_sas_metadata["req_preamble"] = preamble
+        max_seqlen_q, max_seqlen_kv, start_pos, sas_signature = preamble
+        has_prefill = self.num_prefills > 0
+
+
+
+
+cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+            # Prefill changes the mask layout, and the equivalence proof only
+            # covers c1, so gate reuse on both.
+            sas_signature=(
+                sas_signature if self._a5_c1_sas_cache_enabled and not has_prefill else None
+            ),
+        )
